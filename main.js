@@ -11,7 +11,7 @@ const { Cu, } = require("chrome");
 const { viewFor } = require("sdk/view/core");
 const Windows = require("sdk/windows").browserWindows;
 const { prefs: Prefs, } = require("sdk/simple-prefs");
-const { Item, Menu, } = require("sdk/context-menu");
+const { Item, Menu, PageContext, } = require("sdk/context-menu");
 const Tabs = require("sdk/tabs");
 const File = require("sdk/io/file");
 const { OS, } = Cu.import("resource://gre/modules/osfile.jsm", {});
@@ -27,68 +27,89 @@ const {
 const runInTab = require('es6lib/runInTab');
 
 const SCRIPT = 'contentScript';
-const BUTTON_LABEL_BASE = 'Google Search for';
-const BUTTON_LABEL_IMAGE = BUTTON_LABEL_BASE +' this image';
-const BUTTON_LABEL_BACKGROUND = BUTTON_LABEL_BASE +' background image';
+const labels = {
+	init: 'fkhlgnmxfdkgnsdyjknfksdlfnkljfdybgaewkljtngxcjkbn',
+	base: 'No image found',
+	image: 'Google Search for this image',
+	hidden: 'Google Search for the image behind this element',
+	background: 'Google Search for background image',
+};
 
 
 let menu; // global ContextMenu instance
 
 function ContextMenu() {
 	this.onMessage = this.onMessage.bind(this);
+	this.onClick = this.onClick.bind(this);
 	this.item = new Item(this);
 }
 Object.assign(ContextMenu.prototype, {
-	label: BUTTON_LABEL_BASE,
+	_label: labels.init,
 	image: 'https://www.google.com/images/icons/product/images-32.gif',
 
+	set label(value) { this._label = this.item.value = value; },
+	get label() { return this._label; },
+
 	/**
-	 * Called when the context menu is opened. Decides whether an image, a background image or no image was clicked.
-	 * Also reports the src-url of the clicked element to the 'onMessage' method.
-	 * Also reports 'invoke' to the 'onMessage' method if the menu item was invoked through other means than a click.
-	 * @param  {Element}  node  The DOM node the will be opened for.
-	 * @return {string|false}   The menu items display text or false to hide the item.
+	 * Forwards invoke events.
 	 * @note '[SCRIPT]:' is used instead of 'contentScript:' to pass the static analysis of Mozilla's automated signing.
 	 */
 	[SCRIPT]: '('+ ((image, background) => {
-		self.on('context', node => {
-			if (node.tagName == 'IMG') {
-				self.postMessage(node.src);
-				return image;
-			}
-			const url = (function walk(node) {
-				let background, match;
-				return (background = window.getComputedStyle(node).backgroundImage)
-				&& (match = background.match(/^url\(["']?(.*?)["']?\)/))
-				&& match[1]
-				|| node.parentNode && node.parentNode.ownerDocument && walk(node.parentNode);
-			})(node);
-			self.postMessage(url);
-			return url && background;
-		});
+		self.on('context', node => true);
 		self.on('click', () => self.postMessage('invoke'));
-	}) +')('+ [ BUTTON_LABEL_IMAGE, BUTTON_LABEL_BACKGROUND, ].map(s => `"${ s }"`) +')',
+	}) +')()',
 
 	/**
-	 * Receives the messages sent by 'contentScript' and forwards them to this.search().
-	 * @param  {string}  url  An url or 'invoke'.
+	 * Called when the context menu is opened on { x, y, }. Asynchronously sets the type and url of the target image (if any) to this
+	 * and sets the element text a appropriate.
+	 * @param  {Element}  node  The DOM node the will be opened for.
+	 * @return {string|false}   The menu items display text or false to hide the item.
 	 */
-	onMessage(url) {
-		if (url == 'invoke') {
-			if (this.ignoreNextInvoke) {
-				this.ignoreNextInvoke = false;
-			} else {
-				this.search('_self').catch(this.error);
-			}
+	show: async(function*({ x, y, }) {
+		console.log('show at', x, y);
+		const { url, type, } = (yield runInTab(
+			Tabs.activeTab,
+			(x, y) => {
+				console.log('content', x, y);
+				const node = document.elementFromPoint(x, y);
+				console.log('node', node.tagName);
+				if (node.tagName == 'IMG') {
+					return { url: node.src, type: 'image', };
+				}
+				const url = (function walk(node) {
+					let background, match;
+					return (background = window.getComputedStyle(node).backgroundImage)
+					&& (match = background.match(/^url\(["']?(.*?)["']?\)/))
+					&& match[1]
+					|| node.parentNode && node.parentNode.ownerDocument && walk(node.parentNode);
+				})(node);
+				self.postMessage(url);
+				return { url, type: 'background', };
+			},
+			x, y
+		));
+		console.log('message', type, url);
+		this.element[!url ? 'setAttribute' : 'removeAttribute']('disabled', 'true');
+		this.element.label = labels[type] || labels.base;
+		this.url = url;
+	}),
+
+	/**
+	 * Receives the messages SDKs 'click' events.
+	 */
+	onMessage() {
+		if (this.ignoreNextInvoke) {
+			this.ignoreNextInvoke = false;
 		} else {
-			this.url = url;
+			this.search('_self').catch(this.error);
 		}
 	},
 
 	/**
-	 * Menu items click handler.
+	 * Menu items click handler. Necessary to detect mouse-wheel-clicks and modifier keys.
 	 */
 	onClick({ button, ctrlKey, }) {
+		console.log('item clicked', button, ctrlKey);
 		(button === 1 || ctrlKey && (this.ignoreNextInvoke = true)) && this.search('_blank');
 	},
 
@@ -176,11 +197,11 @@ Object.assign(ContextMenu.prototype, {
 /**
  * Forwards click events to menu.onClick(). Necessary to detect mouse-wheel- and ctrl-clicks
  */
-const clickHandler = event => (
+/*const clickHandler = event => (
 	(/^menuitem$/i).test(event.target.tagName)
 	&& event.target.label.startsWith(menu.label)
 	&& menu.onClick(event)
-);
+);*/
 
 /**
  * initialises the add-on for a window
@@ -189,7 +210,23 @@ const clickHandler = event => (
  */
 function windowOpened(window) {
 	const { document, } = viewFor(window);
-	document.querySelector('#contentAreaContextMenu').addEventListener('click',clickHandler);
+	const content = document.querySelector('#content');
+
+	// document.querySelector('#contentAreaContextMenu').addEventListener('click', clickHandler);
+	document.addEventListener('popupshowing', ({ target, clientX: x, clientY: y, }) => {
+		if (target.id !== 'contentAreaContextMenu') { return; }
+		const offset = content.getBoundingClientRect();
+		x -= offset.x; y -= offset.y;
+		console.log('xy', x, y);
+		if (x < 0 || y < 0) { return; }
+		const element = menu.element = document.querySelector('#context-findimage') || Array.filter(
+			document.querySelectorAll('.addon-context-menu-item'),
+			item => item.label === labels.init
+		)[0];
+		element.id = 'context-findimage';
+		element.addEventListener('click', menu.onClick);
+		menu.show({ x, y, });
+	});
 }
 
 /**
@@ -199,7 +236,7 @@ function windowOpened(window) {
  */
 function windowClosed(window) {
 	const { document, } = viewFor(window);
-	document.querySelector('#contentAreaContextMenu').removeEventListener('click', clickHandler);
+	// document.querySelector('#contentAreaContextMenu').removeEventListener('click', clickHandler);
 }
 
 /**
