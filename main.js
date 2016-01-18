@@ -11,16 +11,17 @@ const { Cu, } = require("chrome");
 const { viewFor } = require("sdk/view/core");
 const Windows = require("sdk/windows").browserWindows;
 const { prefs: Prefs, } = require("sdk/simple-prefs");
-const { Item, Menu, PageContext, } = require("sdk/context-menu");
+const { Item, Menu, SelectorContext, } = require("sdk/context-menu");
 const Tabs = require("sdk/tabs");
 const File = require("sdk/io/file");
+const NameSpace = require('sdk/core/namespace').ns;
 const { OS, } = Cu.import("resource://gre/modules/osfile.jsm", {});
 Cu.importGlobalProperties([ 'btoa', ]); /* global btoa */
 const toBase64 = btoa;
 
 const {
 	concurrent: { async, },
-	/* global createElement */
+	dom: { createElement, },
 	network: { HttpRequest, mimeTypes, arrayBufferToString, },
 	functional: { noop, Logger, log, },
 } = require('es6lib');
@@ -28,99 +29,92 @@ const runInTab = require('es6lib/runInTab');
 
 const SCRIPT = 'contentScript';
 const labels = {
-	init: 'fkhlgnmxfdkgnsdyjknfksdlfnkljfdybgaewkljtngxcjkbn',
-	base: 'No image found',
-	image: 'Google Search for this image',
-	hidden: 'Google Search for the image behind this element',
-	background: 'Google Search for background image',
+	init: 'uninitialised+sHg8QRzF9a2qpccgRd2y',
+	none: 'No image found',
+	one: 'Image search for ',
+	more: 'Image search for ...',
 };
 
 
+let _private; // NameSpace to add private values to xul elements
 let menu; // global ContextMenu instance
 
 function ContextMenu() {
-	this.onMessage = this.onMessage.bind(this);
-	this.onClick = this.onClick.bind(this);
-	this.item = new Item(this);
+	this.onInvoke = this.onInvoke.bind(this);
+	this.items = [ new Item({ label: 'none', }), ];
+	this.item = new Menu(this);
 }
 Object.assign(ContextMenu.prototype, {
-	_label: labels.init,
+	label: labels.init,
 	image: 'https://www.google.com/images/icons/product/images-32.gif',
-
-	set label(value) { this._label = this.item.value = value; },
-	get label() { return this._label; },
+	context: SelectorContext('*'),
 
 	/**
-	 * Forwards invoke events.
-	 * @note '[SCRIPT]:' is used instead of 'contentScript:' to pass the static analysis of Mozilla's automated signing.
+	 * Called when the context menu is opened at { x, y, }. Retrieves meta information of any kind of image at the position in the current tab
+	 * and shows the <menu> as appropriate.
+	 * @param  {<menu>}  element   The item instance whose context menu showed up.
+	 * @param  {object}  position  { x, y, } coordinates of the target location.
 	 */
-	[SCRIPT]: '('+ ((image, background) => {
-		self.on('context', node => true);
-		self.on('click', () => self.postMessage('invoke'));
-	}) +')()',
-
-	/**
-	 * Called when the context menu is opened on { x, y, }. Asynchronously sets the type and url of the target image (if any) to this
-	 * and sets the element text a appropriate.
-	 * @param  {Element}  node  The DOM node the will be opened for.
-	 * @return {string|false}   The menu items display text or false to hide the item.
-	 */
-	show: async(function*({ x, y, }) {
-		console.log('show at', x, y);
-		const { url, type, } = (yield runInTab(
+	onShow: async(function*(element, { x, y, }) {
+		const images = (yield runInTab(
 			Tabs.activeTab,
 			(x, y) => {
-				console.log('content', x, y);
-				const node = document.elementFromPoint(x, y);
-				console.log('node', node.tagName);
-				if (node.tagName == 'IMG') {
-					return { url: node.src, type: 'image', };
-				}
-				const url = (function walk(node) {
-					let background, match;
-					return (background = window.getComputedStyle(node).backgroundImage)
-					&& (match = background.match(/^url\(["']?(.*?)["']?\)/))
-					&& match[1]
-					|| node.parentNode && node.parentNode.ownerDocument && walk(node.parentNode);
-				})(node);
-				self.postMessage(url);
-				return { url, type: 'background', };
+				const images = [ ];
+				(function find(node) {
+					if (!node || node === document.documentElement) { return; }
+
+					if (node.tagName == 'IMG') {
+						images.push({ url: node.src, type: 'image', title: node.title || node.alt || node.id || node.className, });
+					}
+					[ null, ':before', ':after', ].forEach((pseudo, background, match) => {
+						(background = window.getComputedStyle(node, pseudo).backgroundImage)
+						&& (match = background.match(/^url\(["']?(.*?)["']?\)/)) && match[1]
+						&& images.push({ url: match[1], type: pseudo || 'background', });
+					});
+
+					const visibility = node.style.visibility;
+					node.style.visibility = 'hidden';
+					find(document.elementFromPoint(x, y));
+					node.style.visibility = visibility;
+				})(document.elementFromPoint(x, y));
+				return images;
 			},
 			x, y
 		));
-		console.log('message', type, url);
-		this.element[!url ? 'setAttribute' : 'removeAttribute']('disabled', 'true');
-		this.element.label = labels[type] || labels.base;
-		this.url = url;
+		if (!images.length) {
+			element.label = labels.none;
+			element.setAttribute('disabled', 'true');
+			return;
+		}
+		element.removeAttribute('disabled');
+		this.defaultImage = images[0];
+		const items = element.querySelector('menupopup');
+		items.textContent = '';
+		element.label = images.length === 1 ? labels.one + imageTitle(images[0]) : labels.more;
+		images.forEach(image => addInvokeListener(
+			items.appendChild(items.ownerDocument.createElement('menuitem')),
+			({ button, ctrlKey, }) => {
+				!image.used && (image.used = true)
+				&& this.search(button === 1 || ctrlKey ? '_blank' : '_self', image.url);
+			}).setAttribute('label', imageTitle(image))
+		);
 	}),
 
 	/**
-	 * Receives the messages SDKs 'click' events.
+	 * Main menu item click handler to allow direct clicks on the <menu> item.
 	 */
-	onMessage() {
-		if (this.ignoreNextInvoke) {
-			this.ignoreNextInvoke = false;
-		} else {
-			this.search('_self').catch(this.error);
-		}
-	},
-
-	/**
-	 * Menu items click handler. Necessary to detect mouse-wheel-clicks and modifier keys.
-	 */
-	onClick({ button, ctrlKey, }) {
-		console.log('item clicked', button, ctrlKey);
-		(button === 1 || ctrlKey && (this.ignoreNextInvoke = true)) && this.search('_blank');
+	onInvoke({ button, ctrlKey, }) {
+		!this.defaultImage.used && (this.defaultImage.used = true)
+		&& this.search(button === 1 || ctrlKey ? '_blank' : '_self', this.defaultImage.url);
 	},
 
 	/**
 	 * Starts the image search for a given url and target.
 	 * @param  {string}  target  '_self' or '_blank'
-	 * @param  {string}  url     Optional src-url of the image to search for, supports 'https?:', 'file:', 'resource:' and 'data:base64'. Default: this.url
+	 * @param  {string}  url     Src-url of the image to search for, supports 'https?:', 'file:', 'resource:' and 'data:base64'.
 	 * @return {Promise}         Resolves once the search is sent to Google.
 	 */
 	search(target, url) {
-		url = url || this.url;
 		return new Promise((resolve, reject) => {
 			if (target == '_blank') {
 				Tabs.open({
@@ -149,7 +143,6 @@ Object.assign(ContextMenu.prototype, {
 		}
 		if ((/^file:/).test(url)) {
 			const path = File.join(...url.replace(/^file:\/*(\/|~|[A-Z]+:)/, '$1').split(/\//g)); // absolute path in Linux, Windows and OSX
-			console.log('load file', path);
 			if (!File.exists(path)) { throw new Error('Couldn\'t find file "'+ path +'"'); }
 			const image = toBase64(File.read(path, 'b'));
 			return this.load(tab, image, true);
@@ -160,7 +153,6 @@ Object.assign(ContextMenu.prototype, {
 		}
 		if (isData || (/^data:/).test(url)) {
 			const image = url.replace(/^.*?,/, '').replace(/\+/g, '-').replace(/\//g, '_');
-			console.log('load data', image.length);
 			return runInTab(
 				tab,
 				'../node_modules/es6lib/namespace.js', '../node_modules/es6lib/object.js', '../node_modules/es6lib/dom.js',
@@ -192,16 +184,37 @@ Object.assign(ContextMenu.prototype, {
 		viewFor(Windows.activeWindow).alert('Something went wrong, sorry: '+ (error && error.message || error));
 	},
 
+	destroy() {
+		return this.item.destroy();
+	},
+
 });
 
-/**
- * Forwards click events to menu.onClick(). Necessary to detect mouse-wheel- and ctrl-clicks
- */
-/*const clickHandler = event => (
-	(/^menuitem$/i).test(event.target.tagName)
-	&& event.target.label.startsWith(menu.label)
-	&& menu.onClick(event)
-);*/
+function addInvokeListener(element, handler) {
+	const popup = element.ownerDocument.querySelector('#contentAreaContextMenu');
+	const wrapper = event => event.target === element && popup.hidePopup() === handler(event);
+	element.addEventListener('click', wrapper);
+	element.addEventListener('command', wrapper);
+	return element;
+}
+
+function imageTitle(image) {
+	const title = image.title ? ': `'+ image.title +'´' : '';
+	switch (image.type) {
+		case ':before': case ':after': {
+			return image.type +'-image'+ title;
+		}
+		case 'image': {
+			return 'Image'+ title;
+		}
+		case 'background': {
+			return 'background'+ title;
+		}
+		default: {
+			return title.replace(/^\:\ /, '');
+		}
+	}
+}
 
 /**
  * initialises the add-on for a window
@@ -209,24 +222,27 @@ Object.assign(ContextMenu.prototype, {
  * @param  {high-level window}   window    the window that just opened
  */
 function windowOpened(window) {
-	const { document, } = viewFor(window);
+	const { gBrowser, document, } = viewFor(window);
 	const content = document.querySelector('#content');
 
-	// document.querySelector('#contentAreaContextMenu').addEventListener('click', clickHandler);
-	document.addEventListener('popupshowing', ({ target, clientX: x, clientY: y, }) => {
+	const onPopup = _private(gBrowser).onPopup = ({ target, clientX: x, clientY: y, }) => {
 		if (target.id !== 'contentAreaContextMenu') { return; }
 		const offset = content.getBoundingClientRect();
 		x -= offset.x; y -= offset.y;
-		console.log('xy', x, y);
 		if (x < 0 || y < 0) { return; }
-		const element = menu.element = document.querySelector('#context-findimage') || Array.filter(
-			document.querySelectorAll('.addon-context-menu-item'),
-			item => item.label === labels.init
-		)[0];
-		element.id = 'context-findimage';
-		element.addEventListener('click', menu.onClick);
-		menu.show({ x, y, });
-	});
+		let element = document.querySelector('#context-findimage');
+		if (!element) {
+			element = Array.filter(
+				document.querySelectorAll('.addon-context-menu-item'),
+				item => item.label === labels.init
+			)[0];
+			element.id = 'context-findimage';
+			addInvokeListener(element, menu.onInvoke);
+		}
+		menu.onShow(element, { x, y, });
+	};
+
+	document.addEventListener('popupshowing', onPopup);
 }
 
 /**
@@ -235,14 +251,16 @@ function windowOpened(window) {
  * @param  {high-level window}   window    the window that just closed / is about to close (?)
  */
 function windowClosed(window) {
-	const { document, } = viewFor(window);
-	// document.querySelector('#contentAreaContextMenu').removeEventListener('click', clickHandler);
+	const { gBrowser, document, } = viewFor(window);
+	const { onPopup, } = _private(gBrowser);
+	document.removeEventListener('popupshowing', onPopup);
 }
 
 /**
  * addons main entry point
  */
 function startup() {
+	_private = NameSpace();
 	menu = new ContextMenu();
 	Array.forEach(Windows, windowOpened);
 	Windows.on('open', windowOpened);
@@ -257,7 +275,9 @@ function shutdown() {
 	Windows.removeListener('close', windowClosed);
 	Windows.removeListener('open', windowOpened);
 	Array.forEach(Windows, windowClosed);
-	menu && menu.destroy && menu.destroy(); // destroy isn't always present ...
+	menu && menu.destroy();
+	_private = null;
+	console.log('disabled addon');
 }
 
 // make sdk run startup
