@@ -30,9 +30,10 @@ const runInTab = require('es6lib/runInTab');
 const SCRIPT = 'contentScript';
 const labels = {
 	init: 'uninitialised+sHg8QRzF9a2qpccgRd2y',
+	pending: 'Searching \u2026',
 	none: 'No image found',
 	one: 'Image search for ',
-	more: 'Image search for ...',
+	more: 'Image search for \u2026',
 };
 
 
@@ -56,6 +57,11 @@ Object.assign(ContextMenu.prototype, {
 	 * @param  {object}  position  { x, y, } coordinates of the target location.
 	 */
 	onShow: async(function*(element, { x, y, }) {
+		const items = element.querySelector('menupopup');
+		element.setAttribute('disabled', 'true');
+		element.label = labels.pending;
+		items.textContent = '';
+
 		const images = (yield runInTab(
 			Tabs.activeTab,
 			(x, y) => {
@@ -64,39 +70,38 @@ Object.assign(ContextMenu.prototype, {
 					if (!node || node === document.documentElement) { return; }
 
 					if (node.tagName == 'IMG') {
-						images.push({ url: node.src, type: 'image', title: node.title || node.alt || node.id || node.className, });
+						images.push({ url: node.src, type: 'image', title: node.title, alt: node.alt, id: node.id, className: node.className, });
 					}
 					[ null, ':before', ':after', ].forEach((pseudo, background, match) => {
 						(background = window.getComputedStyle(node, pseudo).backgroundImage)
 						&& (match = background.match(/^url\(["']?(.*?)["']?\)/)) && match[1]
-						&& images.push({ url: match[1], type: pseudo || 'background', });
+						&& images.push({ url: match[1], type: pseudo || 'background', tagName: node.tagName, title: node.title, id: node.id, className: node.className, });
 					});
 
 					const visibility = node.style.visibility;
-					node.style.visibility = 'hidden';
-					find(document.elementFromPoint(x, y));
-					node.style.visibility = visibility;
+					const priority = node.style.getPropertyPriority('visibility');
+					node.style.setProperty('visibility', 'hidden', 'important');
+					const next = document.elementFromPoint(x, y);
+					next !== node && find(next);
+					node.style.setProperty('visibility', visibility, priority);
 				})(document.elementFromPoint(x, y));
 				return images;
 			},
 			x, y
 		));
-		if (!images.length) {
-			element.label = labels.none;
-			element.setAttribute('disabled', 'true');
-			return;
-		}
+
+		if (!images.length) { return element.label = labels.none; }
+
 		element.removeAttribute('disabled');
 		this.defaultImage = images[0];
-		const items = element.querySelector('menupopup');
-		items.textContent = '';
-		element.label = images.length === 1 ? labels.one + imageTitle(images[0]) : labels.more;
+		element.label = images.length === 1 ? imageTitle(images[0], 30, labels.one) : labels.more;
+
 		images.forEach(image => addInvokeListener(
 			items.appendChild(items.ownerDocument.createElement('menuitem')),
 			({ button, ctrlKey, }) => {
 				!image.used && (image.used = true)
 				&& this.search(button === 1 || ctrlKey ? '_blank' : '_self', image.url);
-			}).setAttribute('label', imageTitle(image))
+			}).setAttribute('label', imageTitle(image, 60))
 		);
 	}),
 
@@ -190,6 +195,7 @@ Object.assign(ContextMenu.prototype, {
 
 });
 
+// handler may be called twice (click + command)
 function addInvokeListener(element, handler) {
 	const popup = element.ownerDocument.querySelector('#contentAreaContextMenu');
 	const wrapper = event => event.target === element && popup.hidePopup() === handler(event);
@@ -198,22 +204,24 @@ function addInvokeListener(element, handler) {
 	return element;
 }
 
-function imageTitle(image) {
-	const title = image.title ? ': `'+ image.title +'´' : '';
-	switch (image.type) {
-		case ':before': case ':after': {
-			return image.type +'-image'+ title;
-		}
-		case 'image': {
-			return 'Image'+ title;
-		}
-		case 'background': {
-			return 'background'+ title;
-		}
-		default: {
-			return title.replace(/^\:\ /, '');
-		}
-	}
+function imageTitle(image, maxLength, title = '') {
+	title += {
+		':before': ':before-image',
+		':after': ':after-image',
+		'image': 'Image',
+		'background': 'background',
+	}[image.type] +' ';
+	const name = image.title || image.alt || image.tagName || image.id || image.className || image.url;
+	return title + shorten('`'+ name +'´', maxLength - title.length);
+}
+
+function shorten(string, length) {
+	if (length < 5) { return ''; }
+	if (string.length <= length) { return string; }
+	if (length < 10) { return string.slice(0, 8) +'\u2026'+ string.slice(-1); }
+	const hasSuffix = string.match(/(\..{1,5})$/);
+	if (hasSuffix) { return string.slice(0, length - hasSuffix[1].length - 1) +'\u2026'+ hasSuffix[1]; }
+	return string.slice(0, length - 2) +'\u2026'+ string.slice(-1);
 }
 
 /**
@@ -271,13 +279,11 @@ function startup() {
  * removes all listeners and reverts all changes
  */
 function shutdown() {
-	console.log('disabling addon');
 	Windows.removeListener('close', windowClosed);
 	Windows.removeListener('open', windowOpened);
 	Array.forEach(Windows, windowClosed);
 	menu && menu.destroy();
 	_private = null;
-	console.log('disabled addon');
 }
 
 // make sdk run startup
