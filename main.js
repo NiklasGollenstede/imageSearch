@@ -7,7 +7,7 @@
  * Works with linked/online, local, firefox-internal and inline images.
  */
 
-const { Cu, } = require("chrome");
+const { Cu, Cc, Ci, components: Components, } = require("chrome");
 const { viewFor } = require("sdk/view/core");
 const Windows = require("sdk/windows").browserWindows;
 const { prefs: Prefs, } = require("sdk/simple-prefs");
@@ -15,9 +15,9 @@ const { Item, Menu, SelectorContext, } = require("sdk/context-menu");
 const Tabs = require("sdk/tabs");
 const File = require("sdk/io/file");
 const NameSpace = require('sdk/core/namespace').ns;
-const { OS, } = Cu.import("resource://gre/modules/osfile.jsm", {});
-Cu.importGlobalProperties([ 'btoa', ]); /* global btoa */
-const toBase64 = btoa;
+Cu.importGlobalProperties([ 'btoa', 'URL', ]); /* globals btoa, URL */ const toBase64 = btoa;
+const DNS = Cc['@mozilla.org/network/dns-service;1'].createInstance(Ci.nsIDNSService);
+const { currentThread, } = Cc['@mozilla.org/thread-manager;1'].getService(Ci.nsIThreadManager);
 
 const {
 	concurrent: { async, },
@@ -29,7 +29,7 @@ const runInTab = require('es6lib/runInTab');
 
 const SCRIPT = 'contentScript';
 const labels = {
-	init: 'uninitialised+sHg8QRzF9a2qpccgRd2y',
+	init: 'Failed to load',
 	pending: 'Searching \u2026',
 	none: 'No image found',
 	one: 'Image search for ',
@@ -66,25 +66,35 @@ Object.assign(ContextMenu.prototype, {
 			Tabs.activeTab,
 			(x, y) => {
 				const images = [ ];
-				(function find(node) {
-					if (!node || node === document.documentElement) { return; }
-
-					if (node.tagName == 'IMG') {
-						images.push({ url: node.src, type: 'image', title: node.title, alt: node.alt, id: node.id, className: node.className, });
+				(function find(node, x, y) {
+					if (!node || node === node.ownerDocument.documentElement) { return; }
+					if (node.tagName === 'IFRAME') {
+						const offset = node.getBoundingClientRect();
+						const _x = x - offset.x, _y = y - offset.y;
+						find(node.contentDocument.elementFromPoint(_x, _y), _x, _y);
 					}
+
+					node.tagName === 'IMG' && images.push({
+						url: node.currentSrc || node.src, type: 'image',
+						title: node.title, alt: node.alt, id: node.id,
+					});
 					[ null, ':before', ':after', ].forEach((pseudo, background, match) => {
 						(background = window.getComputedStyle(node, pseudo).backgroundImage)
 						&& (match = background.match(/^url\(["']?(.*?)["']?\)/)) && match[1]
-						&& images.push({ url: match[1], type: pseudo || 'background', tagName: node.tagName, title: node.title, id: node.id, className: node.className, });
+						&& images.push({
+							url: match[1], type: pseudo || 'background',
+							title: node.title, id: node.id,
+							tagName: (/^(?:article|body|button|footer|header|html|input|label|.*?-.*)$/i).test(node.tagName) && node.tagName,
+						});
 					});
 
 					const visibility = node.style.visibility;
 					const priority = node.style.getPropertyPriority('visibility');
 					node.style.setProperty('visibility', 'hidden', 'important');
-					const next = document.elementFromPoint(x, y);
-					next !== node && find(next);
+					const next = node.ownerDocument.elementFromPoint(x, y);
+					next !== node && find(next, x, y);
 					node.style.setProperty('visibility', visibility, priority);
-				})(document.elementFromPoint(x, y));
+				})(document.elementFromPoint(x, y), x, y);
 				return images;
 			},
 			x, y
@@ -101,7 +111,7 @@ Object.assign(ContextMenu.prototype, {
 			({ button, ctrlKey, }) => {
 				!image.used && (image.used = true)
 				&& this.search(button === 1 || ctrlKey ? '_blank' : '_self', image.url);
-			}).setAttribute('label', imageTitle(image, 60))
+			}).setAttribute('label', imageTitle(image, 70))
 		);
 	}),
 
@@ -125,14 +135,15 @@ Object.assign(ContextMenu.prototype, {
 				Tabs.open({
 					url: 'about:blank',
 					inBackground: true,
-					onOpen: tab => resolve(this.load(tab, url)),
+					onOpen: tab => this.load(tab, url).then(resolve, reject),
 				});
 			} else {
 				const tab = Tabs.activeTab;
-				tab.once('load', () => resolve(this.load(tab, url)));
+				tab.once('load', () => this.load(tab, url).then(resolve, reject));
 				tab.url = 'about:blank';
 			}
-		});
+		})
+		.catch(this.error);
 	},
 
 	/**
@@ -144,39 +155,40 @@ Object.assign(ContextMenu.prototype, {
 	 */
 	load: async(function*(tab, url, isData) {
 		if ((/^https?:\/\//).test(url)) {
-			return tab.url = Prefs.searchByUrlTarget.replace(/\${ ?url ?}|$/, encodeURIComponent(url));
+			if ((yield isPublicHost(url))) {
+				console.log('public ip', url);
+				return tab.url = Prefs.searchByUrlTarget.replace(/\${ ?url ?}|$/, encodeURIComponent(url));
+			}
+			console.log('private ip', url);
 		}
 		if ((/^file:/).test(url)) {
-			const path = File.join(...url.replace(/^file:\/*(\/|~|[A-Z]+:)/, '$1').split(/\//g)); // absolute path in Linux, Windows and OSX
-			if (!File.exists(path)) { throw new Error('Couldn\'t find file "'+ path +'"'); }
+			const path = File.join(...decodeURI(url).replace(/^file:\/*(\/|~|[A-Z]+:)/, '$1').split(/\//g)); // absolute path in Linux, Windows and OSX
+			if (!File.exists(path)) { throw new Error(`Couldn't find the file "${ path }"`); }
 			const image = toBase64(File.read(path, 'b'));
 			return this.load(tab, image, true);
 		}
-		if ((/^(resource|chrome):/).test(url)) {
+		if ((/^(?:blob|chrome|https?|resource):/).test(url)) {
 			const image = toBase64(arrayBufferToString((yield HttpRequest(url, { responseType: 'arraybuffer', })).response));
 			return this.load(tab, image, true);
 		}
 		if (isData || (/^data:/).test(url)) {
 			const image = url.replace(/^.*?,/, '').replace(/\+/g, '-').replace(/\//g, '_');
-			return runInTab(
+			return (yield runInTab(
 				tab,
-				'../node_modules/es6lib/namespace.js', '../node_modules/es6lib/object.js', '../node_modules/es6lib/dom.js',
 				options => {
-					const { createElement, } = require('es6lib/dom');
-					document.body.appendChild(createElement('form', {
-						acceptCharset: 'UTF-8',
-						enctype: 'multipart/form-data',
-						method: 'post',
-						action: options.url,
-					}, [ createElement('input', {
-						type: 'hidden',
-						name: 'image_content',
-						value: options.image,
-					}), ]))
-					.submit();
+					const form = document.body.appendChild(document.createElement('form'));
+					form.acceptCharset = 'UTF-8';
+					form.enctype = 'multipart/form-data';
+					form.method  = 'post';
+					form.action  = options.url;
+					const upload = form.appendChild(document.createElement('input'));
+					upload.type  = 'hidden';
+					upload.name  = 'image_content';
+					upload.value = options.image;
+					form.submit();
 				},
 				{ image, url: Prefs.searchByBinaryTarget, }
-			);
+			));
 		}
 		throw new Error('Unsupported protocol "'+ url.replace(/:.*$/, '') +'"');
 	}),
@@ -187,6 +199,7 @@ Object.assign(ContextMenu.prototype, {
 	error(error) {
 		console.error(error);
 		viewFor(Windows.activeWindow).alert('Something went wrong, sorry: '+ (error && error.message || error));
+		throw error;
 	},
 
 	destroy() {
@@ -204,25 +217,54 @@ function addInvokeListener(element, handler) {
 	return element;
 }
 
-function imageTitle(image, maxLength, title = '') {
-	title += {
-		':before': ':before-image',
-		':after': ':after-image',
-		'image': 'Image',
-		'background': 'background',
-	}[image.type] +' ';
-	const name = image.title || image.alt || image.tagName || image.id || image.className || image.url;
-	return title + shorten('`'+ name +'´', maxLength - title.length);
+function imageTitle(image, maxLength, title) {
+	title = (title || '') + ({
+		':before': ':before-image ',
+		':after': ':after-image ',
+		'image': '',
+		'background': 'background ',
+	}[image.type]);
+	const name = shorten(decodeURI(image.title || image.alt || image.id || image.tagName || image.url), maxLength - title.length);
+	name && (title += '“'+ name +'”');
+	return title;
 }
 
 function shorten(string, length) {
-	if (length < 5) { return ''; }
-	if (string.length <= length) { return string; }
-	if (length < 10) { return string.slice(0, 8) +'\u2026'+ string.slice(-1); }
-	const hasSuffix = string.match(/(\..{1,5})$/);
-	if (hasSuffix) { return string.slice(0, length - hasSuffix[1].length - 1) +'\u2026'+ hasSuffix[1]; }
-	return string.slice(0, length - 2) +'\u2026'+ string.slice(-1);
+	if (length < 7) { return ''; } // to short
+	if (string.length <= length) { return string; } // short enough
+	if (length < 10) { return string.slice(0, 9) +'…'; } // to short to bother
+	if ((/^data:/).test(string)) { return (/^data:[^,;]{0,10}.?/).exec(string)[0] +'…'; } // data:-url
+	if ((/^[\w-]{2,30}:\/\//).test(string)) { try { // some other url
+		const url = new URL(string);
+		if (url.origin.length + url.pathname.length <= length) { return url.origin + url.pathname; }
+		let out = url.origin.length < length / 2 ? url.origin +'/' : url.protocol.length < length / 2 ? url.protocol +'//' : '';
+		return out +'…'+ url.pathname.slice(-(length - out.length - 1));
+	} catch(error) { console.error(error); } }
+	return string.slice(0, length - 2) +'…'; // whatever
 }
+
+const hostToIP = (host, flags = 0, recurse = 10) => new Promise((resolve, reject) => DNS.asyncResolve(host, flags, { onLookupComplete(_, record, status) { try {
+	if ((status & 0x80000000) !== 0) { reject(new Error(`DNS lookup of "${ host }" with flags 0b${ flags.toString(2) } failed`)); }
+	const ip = record.getNextAddrAsString();
+	if ((/^[12]?\d{1,2}\.[12]?\d{1,2}\.[12]?\d{1,2}\.[12]?\d{1,2}$/).test(ip)) { resolve(ip); }
+	else if (recurse > 0) { hostToIP(ip, flags, --recurse).then(resolve, reject); }
+	else { reject(new Error(`DNS lookup of "${ host }" with flags 0b${ flags.toString(2) } failed (too much recursion)`)); }
+} catch (error) { reject(error); } }, }, currentThread));
+
+const isPublicHost = async(function*(url) {
+	try {
+		const name = new URL(url).hostname;
+		const ipv4 = (yield hostToIP(name, DNS.RESOLVE_DISABLE_IPV6)).split('.').map(_=>+_);
+		return !(false
+			|| (ipv4[0] === 127)                                  // 127.0.0.0/8      loopback
+			|| (ipv4[0] ===  10)                                  // 10.0.0.0/8       private
+			|| (ipv4[0] === 172 && ipv4[1] >= 16 && ipv4 <= 31)   // 172.16.0.0/12    private
+			|| (ipv4[0] === 192 && ipv4[1] === 168)               // 192.168.0.0/16   private
+			|| (ipv4[0] === 169 && ipv4[1] === 254)               // 169.254.0.0/16   link-local
+		);
+	} catch (error) { console.error('Error', error.stack || error); }
+	return false; // who knows ...
+});
 
 /**
  * initialises the add-on for a window
@@ -233,16 +275,17 @@ function windowOpened(window) {
 	const { gBrowser, document, } = viewFor(window);
 	const content = document.querySelector('#content');
 
-	const onPopup = _private(gBrowser).onPopup = ({ target, clientX: x, clientY: y, }) => {
-		if (target.id !== 'contentAreaContextMenu') { return; }
+	const onPopup = _private(gBrowser).onPopup = event => {
+		if (event.target.id !== 'contentAreaContextMenu') { return; }
 		const offset = content.getBoundingClientRect();
-		x -= offset.x; y -= offset.y;
+		const x = (event.clientX || -event.offsetX) - offset.x;
+		const y = (event.clientY || -event.offsetY) - offset.y;
 		if (x < 0 || y < 0) { return; }
 		let element = document.querySelector('#context-findimage');
 		if (!element) {
 			element = Array.filter(
 				document.querySelectorAll('.addon-context-menu-item'),
-				item => item.label === labels.init
+				item => item.label === labels.init && item.image === menu.image
 			)[0];
 			element.id = 'context-findimage';
 			addInvokeListener(element, menu.onInvoke);
